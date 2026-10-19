@@ -7,16 +7,19 @@
  *  - 레시피 내용이 없는 링크는 'links' 탭(링크 모음)에 따로 기록
  *  - 레시피에도 출처 링크(url)와 출처 종류(source)를 함께 남김
  *  - 같은 게시물(링크)은 중복 저장하지 않음
+ *  - 대표 사진 1장: 인스타/블로그 썸네일을 자동으로 가져오거나 직접 올린 사진을 드라이브 '레시피 노트 사진' 폴더에 보관
  *  - 스크립트 속성에 CLAUDE_API_KEY 가 있으면 AI로 정리, 없으면 규칙 기반(무료)으로 정리
  *
- * 처음 한 번: setup() 실행 → 실행 로그에 나온 TOKEN 을 웹앱/단축어에 입력
+ * 처음 한 번: setup() 실행 → TOKEN 확인 (실행 로그 또는 시트의 '설정' 탭 B2) → 웹앱/단축어에 입력
  */
 
 const SHEETS = {
   recipe: { name: 'recipes', headers: ['id', 'createdAt', 'url', 'title', 'category', 'ingredients', 'sauce', 'steps', 'tips',
-    'caption', 'rating', 'cooked', 'memo', 'method', 'updatedAt', 'source'] },
-  link: { name: 'links', headers: ['id', 'createdAt', 'url', 'title', 'category', 'memo', 'source', 'updatedAt'] }
+    'caption', 'rating', 'cooked', 'memo', 'method', 'updatedAt', 'source', 'image'] },
+  link: { name: 'links', headers: ['id', 'createdAt', 'url', 'title', 'category', 'memo', 'source', 'updatedAt', 'image'] }
 };
+const IMAGE_FOLDER = '레시피 노트 사진';
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
 const SOURCE_LABEL = { instagram: '인스타그램', naver: '네이버 블로그', web: '웹' };
 const LIST_FIELDS = ['ingredients', 'sauce', 'steps', 'tips'];
 const CATEGORIES = ['반찬', '국·찌개', '밥', '면', '제과·제빵', '디저트·간식', '다이어트', '기타'];
@@ -25,6 +28,17 @@ const TZ = 'Asia/Seoul';
 
 /* ───────────── 초기 설정 ───────────── */
 
+/** 시트를 열면 상단에 '🍳 레시피 노트' 메뉴가 생겨요 */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('🍳 레시피 노트')
+    .addItem('초기 설정 / 토큰 보기', 'setup')
+    .addToUi();
+}
+
+/**
+ * 처음 한 번 실행: recipes / links 탭을 만들고 토큰을 발급해요.
+ * 토큰은 ① 실행 로그 ② '설정' 탭 B2 칸 ③ (시트 메뉴에서 실행 시) 알림창 에서 확인할 수 있어요.
+ */
 function setup() {
   Object.keys(SHEETS).forEach(kind => {
     const sh = sheet_(kind);
@@ -36,8 +50,31 @@ function setup() {
   if (!props.getProperty('TOKEN')) {
     props.setProperty('TOKEN', Utilities.getUuid().replace(/-/g, '').slice(0, 16));
   }
-  Logger.log('TOKEN: ' + props.getProperty('TOKEN'));
-  Logger.log('AI 정리: ' + (props.getProperty('CLAUDE_API_KEY') ? '켜짐' : '꺼짐(규칙 기반)'));
+  const token = props.getProperty('TOKEN');
+  imageFolder_(); // 사진 폴더 준비 (드라이브 권한 요청)
+  const ai = props.getProperty('CLAUDE_API_KEY') ? '켜짐 (AI 정리)' : '꺼짐 (무료 규칙 정리)';
+
+  // '설정' 탭에 토큰 적어두기
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const st = ss.getSheetByName('설정') || ss.insertSheet('설정');
+  st.clear();
+  st.getRange(1, 1, 5, 2).setValues([
+    ['항목', '값'],
+    ['TOKEN', token],
+    ['AI 정리', ai],
+    ['안내', '이 TOKEN 값을 웹앱 설정과 단축어의 token 칸에 똑같이 넣어주세요.'],
+    ['웹 앱 URL', '배포 → 배포 관리에서 확인 (…/exec 로 끝나는 주소)']
+  ]);
+  st.getRange(1, 1, 1, 2).setFontWeight('bold');
+  st.getRange(2, 2).setFontWeight('bold').setFontSize(14).setBackground('#FFF1C7');
+  st.setColumnWidth(1, 110); st.setColumnWidth(2, 420);
+
+  Logger.log('TOKEN: ' + token);
+  Logger.log('AI 정리: ' + ai);
+  Logger.log("시트의 '설정' 탭 B2 칸에서도 TOKEN을 볼 수 있어요.");
+  try {
+    SpreadsheetApp.getUi().alert('레시피 노트 설정 완료', 'TOKEN: ' + token + "\n\n'설정' 탭 B2 칸에도 적어뒀어요.", SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (err) { /* 편집기에서 실행하면 알림창 대신 실행 로그로 확인 */ }
 }
 
 /** 캡션 정리가 어떻게 되는지 미리 확인해 보는 함수 (실행 → 로그 확인) */
@@ -91,6 +128,7 @@ function doPost(e) {
       case 'reparse': return json_(reparseRecipe_(body.id, body.caption));
       case 'promote': return json_(promoteLink_(body.id, body.caption));
       case 'delete': return json_(deleteItem_(body.kind === 'link' ? 'link' : 'recipe', body.id));
+      case 'setImage': return json_(setImage_(body.kind === 'link' ? 'link' : 'recipe', body.id, body.data, body.mime));
       default: return json_({ ok: false, message: '알 수 없는 요청이에요.' });
     }
   } catch (err) {
@@ -122,12 +160,17 @@ function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory) {
   // 클립보드에 예전 캡션이 남아 있던 경우는 무시
   if (caption && recipes.some(r => r.caption && r.caption === caption)) caption = '';
   let fetchedTitle = '';
+  let imageSrc = '';
   if (source === 'naver') {
     const blog = fetchNaverBlog_(url); // 블로그는 본문을 직접 가져옴
     if (blog.text) { caption = blog.text; fetchedTitle = blog.title; }
-  } else if (!caption && source === 'instagram') {
-    caption = fetchCaption_(url);
+    imageSrc = blog.image || '';
+  } else if (source === 'instagram') {
+    const meta = fetchInstagramMeta_(url);
+    if (!caption) caption = meta.caption;
+    imageSrc = meta.image;
   }
+  const image = imageFromUrl_(imageSrc, source === 'naver' ? 'https://blog.naver.com/' : '', 'recipe-' + Date.now());
 
   if (!url && !caption) return { ok: false, message: '링크나 캡션이 없어요.' };
   const now = nowStr_();
@@ -136,7 +179,7 @@ function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory) {
   if (!caption) {
     const t = userTitle || cleanTitle_(fetchedTitle) || '이름 없는 링크';
     const item = { id: newId_(), createdAt: now, url: url, title: t, category: userCat || guessCategory_(t, []),
-      memo: '', source: source, updatedAt: now };
+      memo: '', source: source, updatedAt: now, image: image };
     appendItem_('link', item);
     return { ok: true, kind: 'link', id: item.id, item: item, message: '링크 모음에 저장했어요: ' + t };
   }
@@ -147,7 +190,7 @@ function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory) {
   const rec = {
     id: newId_(), createdAt: now, url: url, title: title, category: category,
     ingredients: parsed.ingredients, sauce: parsed.sauce, steps: parsed.steps, tips: parsed.tips,
-    caption: caption, rating: '', cooked: false, memo: '', method: parsed.method, updatedAt: now, source: source
+    caption: caption, rating: '', cooked: false, memo: '', method: parsed.method, updatedAt: now, source: source, image: image
   };
   appendItem_('recipe', rec);
   const from = url ? ' · 출처: ' + (SOURCE_LABEL[source] || '웹') : '';
@@ -189,7 +232,7 @@ function promoteLink_(id, caption) {
   const link = found.rec;
   let text = cleanCaptionInput_(caption);
   if (!text && link.source === 'naver') text = fetchNaverBlog_(link.url).text || '';
-  if (!text && link.source === 'instagram') text = fetchCaption_(link.url);
+  if (!text && link.source === 'instagram') text = fetchInstagramMeta_(link.url).caption;
   if (!text) return { ok: false, message: '정리할 캡션을 붙여넣어 주세요.' };
   const p = organize_(text);
   const now = nowStr_();
@@ -197,7 +240,8 @@ function promoteLink_(id, caption) {
   const rec = {
     id: newId_(), createdAt: link.createdAt || now, url: link.url, title: title, category: link.category || p.category,
     ingredients: p.ingredients, sauce: p.sauce, steps: p.steps, tips: p.tips, caption: text,
-    rating: '', cooked: false, memo: link.memo || '', method: p.method, updatedAt: now, source: link.source || sourceOf_(link.url)
+    rating: '', cooked: false, memo: link.memo || '', method: p.method, updatedAt: now, source: link.source || sourceOf_(link.url),
+    image: link.image || ''
   };
   appendItem_('recipe', rec);
   found.sheet.deleteRow(found.row);
@@ -207,6 +251,7 @@ function promoteLink_(id, caption) {
 function deleteItem_(kind, id) {
   const found = findRow_(kind, id);
   if (!found) return { ok: false, message: '항목을 찾지 못했어요.' };
+  trashImage_(found.rec.image);
   found.sheet.deleteRow(found.row);
   return { ok: true };
 }
@@ -504,7 +549,7 @@ function parseNaverHtml_(html) {
   body = body.replace(/[​ ]/g, ' ').split('\n').map(s => s.replace(/\s+/g, ' ').trim())
     .filter((s, i, a) => s || (a[i - 1] && a[i - 1].trim())).join('\n').trim();
   if (body.length > 20000) body = body.slice(0, 20000);
-  return { title: title, text: body.length >= 15 ? body : '' };
+  return { title: title, text: body.length >= 15 ? body : '', image: meta('og:image') };
 }
 
 function htmlToText_(h) {
@@ -522,26 +567,90 @@ function cleanCaptionInput_(raw) {
   return s;
 }
 
-/** 게시물 미리보기(og:description)에서 캡션 가져오기 — 인스타가 막으면 빈 값 */
-function fetchCaption_(url) {
+/** 인스타 게시물 미리보기 정보(og:description / og:image) 가져오기 — 인스타가 막으면 빈 값 */
+function fetchInstagramMeta_(url) {
+  const out = { caption: '', image: '' };
   try {
     const res = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true, followRedirects: true,
       headers: { 'User-Agent': 'facebookexternalhit/1.1', 'Accept-Language': 'ko-KR,ko;q=0.9' }
     });
-    if (res.getResponseCode() !== 200) return '';
+    if (res.getResponseCode() !== 200) return out;
     const html = res.getContentText();
-    const m = html.match(/<meta[^>]+property="og:description"[^>]+content="([^"]*)"/i) ||
-      html.match(/<meta[^>]+content="([^"]*)"[^>]+property="og:description"/i);
-    if (!m) return '';
-    let d = decodeEntities_(m[1]);
+    let d = metaContent_(html, 'og:description');
     const q = d.indexOf(': "');
     if (q >= 0) d = d.slice(q + 3).replace(/"\s*\.?\s*$/, '');
     d = d.trim();
-    return d.length >= 15 ? d : '';
+    out.caption = d.length >= 15 ? d : '';
+    out.image = metaContent_(html, 'og:image');
+  } catch (err) { /* 무시 */ }
+  return out;
+}
+
+function metaContent_(html, prop) {
+  const m = html.match(new RegExp('<meta[^>]+property="' + prop + '"[^>]+content="([^"]*)"', 'i')) ||
+    html.match(new RegExp('<meta[^>]+content="([^"]*)"[^>]+property="' + prop + '"', 'i'));
+  return m ? decodeEntities_(m[1]).trim() : '';
+}
+
+/* ───────────── 대표 사진 (구글 드라이브) ───────────── */
+
+function imageFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('IMAGE_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (err) { /* 지워졌으면 새로 만듦 */ } }
+  const it = DriveApp.getFoldersByName(IMAGE_FOLDER);
+  const folder = it.hasNext() ? it.next() : DriveApp.createFolder(IMAGE_FOLDER);
+  props.setProperty('IMAGE_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+/** 사진을 드라이브에 저장하고, 웹앱에서 보여줄 주소를 돌려줌 */
+function storeImage_(blob, name) {
+  const file = imageFolder_().createFile(blob.setName(name));
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); // 링크가 있어야 웹앱에서 보여요
+  return 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w800';
+}
+
+/** 인스타·블로그 썸네일 주소에서 사진을 받아 드라이브에 저장 (실패하면 빈 값) */
+function imageFromUrl_(imgUrl, referer, name) {
+  if (!imgUrl) return '';
+  try {
+    const headers = { 'User-Agent': MOBILE_UA };
+    if (referer) headers.Referer = referer;
+    const res = UrlFetchApp.fetch(imgUrl, { muteHttpExceptions: true, followRedirects: true, headers: headers });
+    if (res.getResponseCode() !== 200) return '';
+    const blob = res.getBlob();
+    if (!/^image\//.test(blob.getContentType() || '')) return '';
+    if (blob.getBytes().length > 8 * 1024 * 1024) return '';
+    const ext = (blob.getContentType().split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+    return storeImage_(blob, name + '.' + ext);
   } catch (err) {
     return '';
   }
+}
+
+function trashImage_(imageUrl) {
+  const m = String(imageUrl || '').match(/[?&]id=([^&]+)/);
+  if (!m) return;
+  try { DriveApp.getFileById(m[1]).setTrashed(true); } catch (err) { /* 이미 없음 */ }
+}
+
+/** 웹앱에서 직접 올린 사진 저장 (data 가 비어 있으면 사진 삭제) */
+function setImage_(kind, id, data, mime) {
+  const found = findRow_(kind, id);
+  if (!found) return { ok: false, message: '항목을 찾지 못했어요.' };
+  let url = '';
+  if (data) {
+    const bytes = Utilities.base64Decode(String(data));
+    if (bytes.length > 6 * 1024 * 1024) return { ok: false, message: '사진이 너무 커요.' };
+    url = storeImage_(Utilities.newBlob(bytes, mime || 'image/jpeg'), kind + '-' + id + '-' + Date.now() + '.jpg');
+  }
+  trashImage_(found.rec.image);
+  found.rec.image = url;
+  found.rec.updatedAt = nowStr_();
+  writeRow_(kind, found.row, found.rec);
+  return { ok: true, recipe: found.rec, item: found.rec, message: url ? '사진을 저장했어요' : '사진을 지웠어요' };
 }
 
 function decodeEntities_(s) {

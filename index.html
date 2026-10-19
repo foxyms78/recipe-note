@@ -60,6 +60,14 @@ header{position:sticky;top:0;z-index:5;background:var(--bg);padding-top:env(safe
 .count{font-size:13px;color:var(--sub);margin:2px 2px 8px}
 .list{display:grid;gap:10px;padding-bottom:40px}
 .card{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:14px 16px;cursor:pointer}
+.card.has-thumb{display:flex;gap:12px;align-items:flex-start}
+.card .body{flex:1;min-width:0}
+.thumb{flex:none;width:76px;height:76px;border-radius:12px;background:var(--accent-soft);display:flex;align-items:center;justify-content:center;font-size:30px;overflow:hidden}
+.thumb img,.hero img{width:100%;height:100%;object-fit:cover;display:block}
+.hero{position:relative;border-radius:16px;overflow:hidden;background:var(--accent-soft);aspect-ratio:4/3;margin:4px 0 14px;display:flex;align-items:center;justify-content:center;font-size:56px}
+.hero-btns{position:absolute;right:10px;bottom:10px;display:flex;gap:6px}
+.hero-btns button{border:0;border-radius:999px;padding:6px 12px;font-size:13px;background:rgba(0,0,0,.55);color:#fff}
+.hero.empty{aspect-ratio:auto;height:110px;border:2px dashed var(--line);background:var(--card);flex-direction:column;font-size:15px;color:var(--sub);gap:2px;cursor:pointer}
 .card .row1{display:flex;align-items:flex-start;gap:8px}
 .card h3{font-size:17px;margin:0;flex:1;letter-spacing:-.01em}
 .card .ings{font-size:14px;color:var(--sub);margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -174,6 +182,7 @@ textarea.f-input.tall{min-height:200px}
 <section class="sheet" id="detail"><div class="wrap" id="detailBody"></div></section>
 <section class="sheet" id="form"><div class="wrap" id="formBody"></div></section>
 
+<input type="file" accept="image/*" id="imgFile" hidden>
 <div class="toast" id="toast"></div>
 <div class="loading" id="loading"><div class="spinner"></div></div>
 
@@ -196,6 +205,19 @@ textarea.f-input.tall{min-height:200px}
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const srcOf = r => r.source || (/instagram\.com/.test(r.url||'') ? 'instagram' : /blog\.naver\.com/.test(r.url||'') ? 'naver' : r.url ? 'web' : '');
   const srcTag = r => { const s = srcOf(r); return s ? `<span class="tag src-${s}">${SRC[s]}</span>` : ''; };
+  const CAT_ICON = { '반찬':'🥢', '국·찌개':'🍲', '밥':'🍚', '면':'🍜', '제과·제빵':'🍞', '디저트·간식':'🍰', '다이어트':'🥗', '기타':'🍽️' };
+  const iconOf = r => CAT_ICON[r.category] || '🍽️';
+  // 드라이브 썸네일이 안 열리면 다른 주소로 한 번 더 시도, 그래도 안 되면 분류 아이콘
+  window.__imgFallback = img => {
+    const m = img.src.match(/[?&]id=([^&]+)/);
+    if(m && !img.dataset.fb){ img.dataset.fb = 1; img.src = 'https://lh3.googleusercontent.com/d/' + m[1] + '=w800'; return; }
+    const box = img.parentNode; img.remove(); box.insertAdjacentText('afterbegin', box.dataset.icon || '🍽️');
+  };
+  const imgTag = r => `<img src="${esc(r.image)}" alt="" loading="lazy" onerror="__imgFallback(this)">`;
+  const thumb = r => `<div class="thumb" data-icon="${iconOf(r)}">${r.image ? imgTag(r) : iconOf(r)}</div>`;
+  const hero = r => r.image
+    ? `<div class="hero" data-icon="${iconOf(r)}">${imgTag(r)}<div class="hero-btns"><button id="imgChange">사진 바꾸기</button><button id="imgRemove">삭제</button></div></div>`
+    : `<div class="hero empty" id="imgAdd"><span style="font-size:26px">📷</span>대표 사진 추가</div>`;
   const openLabel = r => srcOf(r) === 'instagram' ? '▶ 영상 보기' : '📖 글 보기';
 
   /* ---------- 서버 ---------- */
@@ -288,22 +310,22 @@ textarea.f-input.tall{min-height:200px}
   }
   function recipeCard(r){
     const ings = [...(r.ingredients||[]), ...(r.sauce||[])];
-    return `<div class="card" role="button" tabindex="0" data-kind="recipe" data-id="${esc(r.id)}">
+    return `<div class="card has-thumb" role="button" tabindex="0" data-kind="recipe" data-id="${esc(r.id)}">${thumb(r)}<div class="body">
       <div class="row1"><h3>${esc(r.title)}</h3><span class="stars-mini">${stars(r.rating)}</span></div>
       ${ings.length ? `<div class="ings">${esc(ings.map(s => s.replace(/\s*[\d.\/]+.*$/, '') || s).join(' · '))}</div>` : ''}
       <div class="meta"><span class="tag">${esc(r.category||'기타')}</span>${srcTag(r)}
         ${r.cooked ? '<span class="tag ok">해봤어요</span>' : ''}
         ${!r.steps?.length && !ings.length ? '<span class="tag warn">정리 확인</span>' : ''}
-      </div></div>`;
+      </div></div></div>`;
   }
   function linkCard(r){
     const memo = (r.memo||'').split('\n')[0];
-    return `<div class="card" role="button" tabindex="0" data-kind="link" data-id="${esc(r.id)}">
+    return `<div class="card has-thumb" role="button" tabindex="0" data-kind="link" data-id="${esc(r.id)}">${thumb(r)}<div class="body">
       <div class="row1"><h3>${esc(r.title)}</h3></div>
       ${memo ? `<div class="ings">${esc(memo)}</div>` : ''}
       <div class="meta"><span class="tag">${esc(r.category||'기타')}</span>${srcTag(r)}<span class="date">${esc((r.createdAt||'').slice(0,10))}</span>
         ${r.url ? `<a class="card-go" href="${esc(r.url)}" target="_blank" rel="noopener">${openLabel(r)}</a>` : ''}
-      </div></div>`;
+      </div></div></div>`;
   }
 
   /* ---------- 상세: 레시피 ---------- */
@@ -323,6 +345,7 @@ textarea.f-input.tall{min-height:200px}
     const empty = !ings.length && !sauce.length && !steps.length;
     $('#detailBody').innerHTML = `
       <div class="bar"><button class="text-btn" data-close>‹ 목록</button><div class="title"></div><button class="text-btn" id="dEdit">수정</button></div>
+      ${hero(r)}
       <h2 class="d-title">${esc(r.title)}</h2>
       <div class="d-meta">
         <span class="tag">${esc(r.category||'기타')}</span>
@@ -364,6 +387,7 @@ textarea.f-input.tall{min-height:200px}
       upsert('recipe', d.recipe); render(); openRecipe(id); toast('다시 정리했어요');
     };
     $('#dDelete').onclick = () => remove('recipe', r);
+    bindHero('recipe', id, openRecipe);
   }
 
   /* ---------- 상세: 링크 ---------- */
@@ -372,6 +396,7 @@ textarea.f-input.tall{min-height:200px}
     const src = srcOf(r);
     $('#detailBody').innerHTML = `
       <div class="bar"><button class="text-btn" data-close>‹ 목록</button><div class="title"></div><button class="text-btn" id="lEdit">수정</button></div>
+      ${hero(r)}
       <h2 class="d-title">${esc(r.title)}</h2>
       <div class="d-meta"><span class="tag">${esc(r.category||'기타')}</span>${srcTag(r)}<span class="date">${esc(r.createdAt)}</span></div>
       ${r.url ? `<a class="btn primary" href="${esc(r.url)}" target="_blank" rel="noopener">${src === 'instagram' ? '▶ 인스타에서 영상 보기' : '📖 원본 글 보기'}</a>
@@ -386,6 +411,7 @@ textarea.f-input.tall{min-height:200px}
     $('#lMemo').onblur = e => { if(e.target.value !== (r.memo||'')) { patch('link', id, { memo: e.target.value }); toast('메모를 저장했어요'); } };
     $('#lEdit').onclick = () => openEditLink(id);
     $('#lDelete').onclick = () => remove('link', r);
+    bindHero('link', id, openLink);
     $('#lPromote').onclick = () => openCaptionForm('레시피로 정리하기', '',
       src === 'naver' ? '비워두면 블로그 글을 다시 불러와서 정리해요.' : '인스타 캡션이나 레시피 글을 붙여넣어 주세요. 메모에 적은 내용을 붙여넣어도 돼요.',
       async caption => {
@@ -393,6 +419,39 @@ textarea.f-input.tall{min-height:200px}
         links = links.filter(x => x.id !== id); upsert('recipe', d.recipe);
         closeSheet('#form'); view = 'recipes'; render(); openRecipe(d.recipe.id); toast(d.message);
       }, src === 'naver');
+  }
+
+  /* ---------- 대표 사진 ---------- */
+  function resizeImage(file, max = 1200){
+    return new Promise((resolve, reject) => {
+      const img = new Image(); const u = URL.createObjectURL(file);
+      img.onload = () => {
+        const k = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(u);
+        resolve(c.toDataURL('image/jpeg', 0.82).split(',')[1]);
+      };
+      img.onerror = () => { URL.revokeObjectURL(u); reject(new Error('사진을 읽지 못했어요')); };
+      img.src = u;
+    });
+  }
+  function bindHero(kind, id, reopen){
+    const pick = () => {
+      const input = $('#imgFile'); input.value = '';
+      input.onchange = async () => {
+        const file = input.files[0]; if(!file) return;
+        const d = await withLoading(async () => api({ action:'setImage', kind, id, data: await resizeImage(file), mime:'image/jpeg' }));
+        upsert(kind, d.item || d.recipe); render(); reopen(id); toast(d.message);
+      };
+      input.click();
+    };
+    if($('#imgAdd')) $('#imgAdd').onclick = pick;
+    if($('#imgChange')) $('#imgChange').onclick = pick;
+    if($('#imgRemove')) $('#imgRemove').onclick = async () => {
+      if(!confirm('대표 사진을 지울까요?')) return;
+      const d = await withLoading(() => api({ action:'setImage', kind, id, data:'' }));
+      upsert(kind, d.item || d.recipe); render(); reopen(id); toast(d.message);
+    };
   }
 
   async function remove(kind, r){
