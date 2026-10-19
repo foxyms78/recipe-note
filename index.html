@@ -306,7 +306,13 @@ textarea.f-input.tall{min-height:200px}
       return;
     }
     if(!arr.length){ list.innerHTML = `<div class="empty"><b>찾는 ${unit}가 없어요</b>다른 단어로 검색해 보세요.</div>`; return; }
-    list.innerHTML = view === 'links' ? arr.map(linkCard).join('') : arr.map(recipeCard).join('');
+    list.innerHTML = view === 'links'
+      ? (links.some(r => ['instagram','naver'].includes(srcOf(r))) ? `<button class="btn" id="retryLinks" style="margin-bottom:2px">🔄 링크에서 레시피 다시 가져오기</button>` : '') + arr.map(linkCard).join('')
+      : arr.map(recipeCard).join('');
+    if($('#retryLinks')) $('#retryLinks').onclick = async () => {
+      const d = await withLoading(() => api({ action:'retryLinks' }));
+      toast(d.message); await load(false);
+    };
   }
   function recipeCard(r){
     const ings = [...(r.ingredients||[]), ...(r.sauce||[])];
@@ -413,12 +419,12 @@ textarea.f-input.tall{min-height:200px}
     $('#lDelete').onclick = () => remove('link', r);
     bindHero('link', id, openLink);
     $('#lPromote').onclick = () => openCaptionForm('레시피로 정리하기', '',
-      src === 'naver' ? '비워두면 블로그 글을 다시 불러와서 정리해요.' : '인스타 캡션이나 레시피 글을 붙여넣어 주세요. 메모에 적은 내용을 붙여넣어도 돼요.',
+      src === 'naver' ? '비워두면 블로그 글을 다시 불러와서 정리해요.' : src === 'instagram' ? '비워두고 정리를 누르면 인스타에서 캡션을 다시 가져와 봐요. 안 되면 캡션이나 메모 내용을 붙여넣어 주세요.' : '레시피 글을 붙여넣어 주세요.',
       async caption => {
         const d = await withLoading(() => api({ action:'promote', id, caption }));
         links = links.filter(x => x.id !== id); upsert('recipe', d.recipe);
         closeSheet('#form'); view = 'recipes'; render(); openRecipe(d.recipe.id); toast(d.message);
-      }, src === 'naver');
+      }, src === 'naver' || src === 'instagram');
   }
 
   /* ---------- 대표 사진 ---------- */

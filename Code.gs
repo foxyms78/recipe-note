@@ -8,7 +8,7 @@
  *  - 레시피에도 출처 링크(url)와 출처 종류(source)를 함께 남김
  *  - 같은 게시물(링크)은 중복 저장하지 않음
  *  - 대표 사진 1장: 인스타/블로그 썸네일을 자동으로 가져오거나 직접 올린 사진을 드라이브 '레시피 노트 사진' 폴더에 보관
- *  - 스크립트 속성에 CLAUDE_API_KEY 가 있으면 AI로 정리, 없으면 규칙 기반(무료)으로 정리
+ *  - 스크립트 속성에 GEMINI_API_KEY(무료) 또는 CLAUDE_API_KEY 가 있으면 AI로 정리, 없으면 규칙 기반(무료)으로 정리
  *
  * 처음 한 번: setup() 실행 → TOKEN 확인 (실행 로그 또는 시트의 '설정' 탭 B2) → 웹앱/단축어에 입력
  */
@@ -23,7 +23,8 @@ const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleW
 const SOURCE_LABEL = { instagram: '인스타그램', naver: '네이버 블로그', web: '웹' };
 const LIST_FIELDS = ['ingredients', 'sauce', 'steps', 'tips'];
 const CATEGORIES = ['반찬', '국·찌개', '밥', '면', '제과·제빵', '디저트·간식', '다이어트', '기타'];
-const AI_MODEL = 'claude-haiku-5-5'; // AI 정리에 쓸 모델 (필요하면 바꾸세요)
+const AI_MODEL = 'claude-haiku-5-5';   // Claude로 정리할 때 모델
+const GEMINI_MODEL = 'gemini-2.5-flash'; // Gemini(무료 등급)로 정리할 때 모델
 const TZ = 'Asia/Seoul';
 
 /* ───────────── 초기 설정 ───────────── */
@@ -52,7 +53,7 @@ function setup() {
   }
   const token = props.getProperty('TOKEN');
   imageFolder_(); // 사진 폴더 준비 (드라이브 권한 요청)
-  const ai = props.getProperty('CLAUDE_API_KEY') ? '켜짐 (AI 정리)' : '꺼짐 (무료 규칙 정리)';
+  const ai = props.getProperty('GEMINI_API_KEY') ? '켜짐 (Gemini)' : props.getProperty('CLAUDE_API_KEY') ? '켜짐 (Claude)' : '꺼짐 (무료 규칙 정리)';
 
   // '설정' 탭에 토큰 적어두기
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -103,6 +104,21 @@ function testParse() {
   Logger.log(JSON.stringify(organize_(sample), null, 2));
 }
 
+/**
+ * 인스타 링크만으로 캡션을 가져올 수 있는지 확인 (편집기에서 실행 → 실행 로그 확인)
+ * 아래 주소를 확인하고 싶은 릴스 링크로 바꿔서 실행해도 돼요.
+ */
+function testInstagram() {
+  const url = 'https://www.instagram.com/reels/C9js7SKpzwk/';
+  const r = fetchInstagramMeta_(normalizeUrl_(url));
+  Logger.log(r.caption ? '✅ 캡션 가져오기 성공:\n' + r.caption.slice(0, 200) : '❌ 캡션을 못 가져왔어요 (인스타가 구글 서버 접근을 막는 중)');
+  Logger.log(r.image ? '✅ 대표 이미지 주소 있음' : '❌ 대표 이미지 없음');
+  if (r.caption) {
+    const p = organize_(r.caption);
+    Logger.log('정리 결과: ' + p.title + ' / 재료 ' + (p.ingredients.length + p.sauce.length) + '개 / 순서 ' + p.steps.length + '단계');
+  }
+}
+
 /* ───────────── 웹 요청 ───────────── */
 
 function doGet() {
@@ -123,7 +139,8 @@ function doPost(e) {
   try {
     switch (body.action) {
       case 'list': return json_({ ok: true, recipes: readAll_('recipe').reverse(), links: readAll_('link').reverse() });
-      case 'save': return json_(saveRecipe_(body.url, body.caption, body.title, body.category));
+      case 'save': return json_(saveRecipe_(body.url, body.caption, body.title, body.category, body.html));
+      case 'retryLinks': return json_(retryLinks_());
       case 'update': return json_(updateItem_(body.kind === 'link' ? 'link' : 'recipe', body.id, body.fields || {}));
       case 'reparse': return json_(reparseRecipe_(body.id, body.caption));
       case 'promote': return json_(promoteLink_(body.id, body.caption));
@@ -140,7 +157,7 @@ function doPost(e) {
 
 /* ───────────── 저장/수정/삭제 ───────────── */
 
-function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory) {
+function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory, pageHtml) {
   const userTitle = String(rawTitle || '').trim().slice(0, 40);
   const userCat = CATEGORIES.indexOf(String(rawCategory || '').trim()) >= 0 ? String(rawCategory).trim() : '';
   const url = normalizeUrl_(resolveUrl_(rawUrl));
@@ -166,7 +183,7 @@ function saveRecipe_(rawUrl, rawCaption, rawTitle, rawCategory) {
     if (blog.text) { caption = blog.text; fetchedTitle = blog.title; }
     imageSrc = blog.image || '';
   } else if (source === 'instagram') {
-    const meta = fetchInstagramMeta_(url);
+    const meta = fetchInstagramMeta_(url, pageHtml);
     if (!caption) caption = meta.caption;
     imageSrc = meta.image;
   }
@@ -248,6 +265,18 @@ function promoteLink_(id, caption) {
   return { ok: true, recipe: rec, message: '레시피로 정리했어요: ' + title };
 }
 
+/** 링크 모음에 있는 인스타·블로그 항목을 다시 가져와서, 캡션이 생기면 레시피로 옮기기 (한 번에 최대 15개) */
+function retryLinks_() {
+  const links = readAll_('link').filter(l => l.source === 'instagram' || l.source === 'naver').slice(0, 15);
+  let moved = 0;
+  links.forEach(l => {
+    const r = promoteLink_(l.id, '');
+    if (r.ok) moved++;
+  });
+  return { ok: true, moved: moved, tried: links.length,
+    message: links.length ? moved + '개를 레시피로 옮겼어요 (' + links.length + '개 시도)' : '다시 가져올 링크가 없어요' };
+}
+
 function deleteItem_(kind, id) {
   const found = findRow_(kind, id);
   if (!found) return { ok: false, message: '항목을 찾지 못했어요.' };
@@ -261,85 +290,148 @@ function deleteItem_(kind, id) {
 function organize_(caption) {
   const empty = { title: '', category: '기타', ingredients: [], sauce: [], steps: [], tips: [], method: 'rule' };
   if (!caption) return empty;
-  const key = PropertiesService.getScriptProperties().getProperty('CLAUDE_API_KEY');
-  if (key) {
-    try { return aiOrganize_(caption, key); } catch (err) { Logger.log('AI 정리 실패, 규칙으로 대체: ' + err.message); }
+  const rule = parseCaption_(caption);
+  rule.category = guessCategory_(rule.title, rule.ingredients);
+  rule.method = 'rule';
+
+  const props = PropertiesService.getScriptProperties();
+  const gemini = props.getProperty('GEMINI_API_KEY');
+  const claude = props.getProperty('CLAUDE_API_KEY');
+  if (gemini || claude) {
+    try {
+      const ai = gemini ? aiGemini_(caption, gemini) : aiClaude_(caption, claude);
+      // AI가 아무것도 못 찾았는데 규칙은 찾았으면 규칙 결과 사용
+      if (ai.ingredients.length + ai.sauce.length + ai.steps.length > 0 ||
+          rule.ingredients.length + rule.sauce.length + rule.steps.length === 0) {
+        if (!ai.title) ai.title = rule.title;
+        return ai;
+      }
+    } catch (err) {
+      Logger.log('AI 정리 실패, 규칙으로 대체: ' + err.message);
+    }
   }
-  const p = parseCaption_(caption);
-  p.category = guessCategory_(p.title, p.ingredients);
-  p.method = 'rule';
-  return p;
+  return rule;
 }
 
-function aiOrganize_(caption, key) {
-  const prompt = '다음은 인스타그램 레시피 게시물의 캡션이야. 레시피 내용만 뽑아서 JSON 하나로만 답해.\n' +
-    '형식: {"title":"메뉴 이름(짧게)","category":"' + CATEGORIES.join('|') + ' 중 하나",' +
-    '"ingredients":["재료와 분량"],"sauce":["양념/소스와 분량"],"steps":["조리 순서 한 단계씩"],"tips":["팁"]}\n' +
-    '규칙: 캡션에 없는 내용은 지어내지 마. 분량은 캡션에 적힌 그대로 써. 해시태그, 인사말, 팔로우·저장 권유 같은 홍보 문구는 빼. ' +
-    '양념이 따로 구분되지 않으면 sauce는 빈 배열로 둬. 레시피가 없으면 배열을 비워 둬.\n\n캡션:\n' + caption;
-  const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-    payload: JSON.stringify({ model: AI_MODEL, max_tokens: 2000, messages: [{ role: 'user', content: prompt }] }),
-    muteHttpExceptions: true
-  });
-  if (res.getResponseCode() !== 200) throw new Error('AI 응답 ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
-  const data = JSON.parse(res.getContentText());
-  const text = (data.content || []).map(c => c.text || '').join('');
-  const m = text.match(/\{[\s\S]*\}/);
+function aiPrompt_(caption) {
+  return '다음은 인스타그램 게시물 캡션이나 블로그 글이야. 레시피 내용만 뽑아서 JSON 하나로만 답해.\n' +
+    '형식: {"title":"메뉴 이름(짧게, 수식어 빼고)","category":"' + CATEGORIES.join('|') + ' 중 하나",' +
+    '"ingredients":["재료와 분량"],"sauce":["양념/소스/드레싱과 분량"],"steps":["조리 순서 한 단계씩"],"tips":["팁"]}\n' +
+    '규칙: 글에 없는 내용은 지어내지 마. 분량은 적힌 그대로 써. 재료가 한 줄에 여러 개면 하나씩 나눠. ' +
+    '인사말, 감탄, 해시태그, 팔로우·저장 권유, 조리시간·인분 정보는 빼. ' +
+    '양념이 따로 구분되지 않으면 sauce는 빈 배열로 둬. 레시피가 없으면 배열을 비워 둬.\n\n글:\n' + normalizeText_(caption).slice(0, 12000);
+}
+
+function aiResult_(text, method) {
+  const m = String(text || '').match(/\{[\s\S]*\}/);
   if (!m) throw new Error('AI 응답에서 JSON을 찾지 못함');
   const o = JSON.parse(m[0]);
-  const arr = v => (Array.isArray(v) ? v : []).map(s => String(s).trim()).filter(Boolean);
+  const arr = v => (Array.isArray(v) ? v : []).map(x => String(x).trim()).filter(Boolean);
   return {
     title: String(o.title || '').trim().slice(0, 40),
     category: CATEGORIES.indexOf(o.category) >= 0 ? o.category : '기타',
     ingredients: arr(o.ingredients), sauce: arr(o.sauce), steps: arr(o.steps), tips: arr(o.tips),
-    method: 'ai'
+    method: method
   };
+}
+
+/** 구글 Gemini (AI Studio 무료 등급 키로 사용 가능) */
+function aiGemini_(caption, key) {
+  const res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': key },
+    payload: JSON.stringify({
+      contents: [{ parts: [{ text: aiPrompt_(caption) }] }],
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.1 }
+    }),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) throw new Error('Gemini 응답 ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
+  const data = JSON.parse(res.getContentText());
+  const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
+  return aiResult_(parts.map(x => x.text || '').join(''), 'ai');
+}
+
+/** Anthropic Claude */
+function aiClaude_(caption, key) {
+  const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+    payload: JSON.stringify({ model: AI_MODEL, max_tokens: 2000, messages: [{ role: 'user', content: aiPrompt_(caption) }] }),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) throw new Error('Claude 응답 ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
+  const data = JSON.parse(res.getContentText());
+  return aiResult_((data.content || []).map(c => c.text || '').join(''), 'ai');
 }
 
 /* 규칙 기반 캡션 정리 */
 
-const EMOJI_RE = /[\p{Extended_Pictographic}\uFE0F\u200D\u20E3]/gu;
-const QTY_RE = /((\d+(\.\d+)?|\d+\/\d+|한|두|세|반)\s*(큰술|작은술|스푼|숟가락|숟갈|티스푼|종이컵|컵|국자|kg|g|ml|L|cc|개|모|봉지|팩|줌|꼬집|장|알|쪽|톨|대|단|포기|캔|tbsp|tsp|ts|T|t|인분|조각|마리|공기|덩이|줄기))|약간|적당량|조금|취향껏|\d\s*[:：]\s*\d/i;
-const STEP_RE = /^\s*(?:(\d{1,2})\s*(?:[.)\]:]|번\b|단계)|[①-⑳]|\d\uFE0F?\u20E3|step\s*\d+\s*[.:)]?|\[\d+\]|\(\d+\))\s*/i;
+const EMOJI_RE = /[\p{Extended_Pictographic}️‍⃣]/gu;
+const UNIT = '큰스푼|작은스푼|큰술|작은술|스푼|숟가락|숟갈|티스푼|종이컵|컵|국자|kg|mg|g|ml|L|cc|oz|개|모|봉지|봉|팩|통|줌|움큼|꼬집|방울|장|알|쪽|톨|대|단|포기|송이|잎|캔|tbsp|tsp|Ts|ts|T|t|인분|조각|마리|공기|덩이|줄기|근';
+const QTY_RE = new RegExp('((\\d+(\\.\\d+)?|\\d+\\/\\d+|한|두|세|네|반)\\s*(' + UNIT + '))|약간|적당량|적당히|조금|넉넉히|취향껏|톡톡|\\d\\s*[:：]\\s*\\d', 'i');
+const STEP_RE = /^\s*(?:(\d{1,2})\s*(?:[.)\]:]|-(?!\d)|번\b|단계)|[①-⑳]|\d️?⃣|step\s*\d+\s*[.:)]?|\[\d+\]|\(\d+\))\s*/i;
 const PROMO_RE = /(팔로우|좋아요|저장해|저장하고|저장 꾹|댓글|DM|디엠|공유해|구독|문의|협찬|광고|프로필 링크|링크는|맞팔|이벤트|공구)/i;
+const META_RE = /(조리\s*시간|소요\s*시간|준비\s*시간|난이도|칼로리|kcal|^\s*\d+\s*인분(\s*기준)?\s*$)/i;
 const SECTIONS = [
-  ['tips', /^(꿀?팁|tip|tips|포인트|참고)$/i],
-  ['sauce', /(양념장?|소스|드레싱|양념\s*재료|소스\s*재료|양념\s*비율|소스\s*비율|비율)/],
-  ['ingredients', /(재료|준비물|필요한\s*것|ingredients?)/i],
-  ['steps', /(만드는\s*법|만드는\s*방법|만들기|조리\s*법|조리\s*방법|조리\s*순서|요리\s*순서|순서|레시피|방법|과정|how\s*to)/i]
+  ['tips', /^(꿀?팁|tip|tips|포인트|참고|주의)$/i],
+  ['sauce', /^(양념장?|소스|드레싱|양념\s*재료|소스\s*재료|양념\s*비율|소스\s*비율|비율|조림장|볶음\s*양념|sauce)$/i],
+  ['ingredients', /^(재료|주\s*재료|부\s*재료|기본\s*재료|필요한\s*재료|재료\s*준비|준비물|필요한\s*것|반죽|토핑|ingredients?)$/i],
+  ['steps', /^(만드는\s*법|만드는\s*방법|만들기|조리\s*법|조리\s*방법|조리\s*순서|요리\s*순서|순서|레시피|방법|과정|how\s*to|recipe|steps?)$/i]
 ];
+const GENERIC_TAG_RE = /^(레시피|요리|집밥|반찬|자취요리|간단요리|초간단요리|초간단레시피|오늘뭐먹지|홈쿡|요리스타그램|먹스타그램|맛스타그램|레시피공유|요리레시피|집밥레시피|다이어트|다이어트식단|다이어트레시피|아이반찬|저녁메뉴|점심메뉴|술안주|밥도둑|cooking|recipe|food|homecooking|reels|릴스)$/i;
+
+/** 인스타 특유의 보이지 않는 공백, 전각 문자 정리 */
+function normalizeText_(text) {
+  return String(text || '').replace(/\r/g, '').replace(/\u2028/g, '\n')
+    .replace(/[\u2800\u3164\u115F\u1160\u200B\u200C\u200E\u200F\uFEFF\u00A0]/g, ' ')
+    .replace(/[\uFF01-\uFF5E]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/\u3000/g, ' ');
+}
 
 function parseCaption_(text) {
   const out = { title: '', ingredients: [], sauce: [], steps: [], tips: [] };
   if (!text) return out;
+  const norm = normalizeText_(text);
+  const tags = (norm.match(/#[^\s#]+/g) || []).map(t => t.slice(1));
 
-  const lines = String(text).replace(/\r/g, '').replace(/\u2028/g, '\n').split('\n')
-    .map(l => l.replace(/#[^\s#]+/g, '').trim())
-    .filter(l => l && /[\p{L}\p{N}]/u.test(l));
+  const lines = [];
+  norm.split('\n').forEach(raw => {
+    const l = raw.replace(/#[^\s#]+/g, '').trim();
+    if (!l || !/[\p{L}\p{N}]/u.test(l)) return;
+    // "1. 썰기 2. 굽기 3. 부치기" 처럼 한 줄에 이어 쓴 순서 나누기
+    if (STEP_RE.test(l)) l.split(/\s+(?=(?:\d{1,2}[.)]\s|[①-⑳]|\d️?⃣))/).forEach(x => lines.push(x.trim()));
+    else lines.push(l);
+  });
+
+  const t = pickTitle_(lines, tags);
+  out.title = t.title;
 
   let section = null;
-  let titleDone = false;
-
+  let numberedSteps = 0;
+  let ended = false;
   lines.forEach((line, idx) => {
+    if (ended || idx === t.index) return;
     const plain = line.replace(EMOJI_RE, '').trim();
-
-    // 제목: 첫 번째 의미 있는 줄
-    if (!titleDone) {
-      titleDone = true;
-      const header = detectHeader_(plain);
-      if (!header || header.section === 'steps' && !header.inline && plain.length > 6) {
-        if (!PROMO_RE.test(plain)) { out.title = cleanTitle_(plain); return; }
-      }
+    if (!plain) return;
+    // 웹에서 복사할 때 딸려오는 좋아요 수·댓글 수·아이디 → 여기서 캡션 끝
+    if (/^\d[\d,.]*\s*(만|천|k)?$/i.test(plain) || /^@?[a-z0-9._]{3,30}\s*[•·]?$/i.test(plain) && !SECTIONS.some(([, re]) => re.test(plain))) {
+      if (out.steps.length || out.ingredients.length) { ended = true; }
+      return;
     }
-
     if (PROMO_RE.test(plain) && !QTY_RE.test(plain)) return;
+    if (META_RE.test(plain) && plain.length <= 30 && !detectHeader_(plain)) return;
 
     // 팁 (줄 앞에 tip/팁)
-    const tipM = plain.match(/^[^\p{L}\p{N}]*(꿀?팁|tip)\s*[.:：)\-]?\s*(.+)$/iu);
+    const tipM = plain.match(/^[^\p{L}\p{N}]*(꿀?팁|tip)\s*[!.:：)\-]?\s*(.+)$/iu);
     if (tipM && tipM[2].length > 2) { out.tips.push(cleanItem_(tipM[2])); return; }
+    if (/(포인트|꿀팁|비법)\s*[!.~♡♥]*$/.test(plain) && plain.length > 6) { out.tips.push(cleanItem_(plain)); return; }
+
+    // "소스는 간장 1큰술, …이에요" / "…1장 준비해주세요" 같은 문장형
+    const sent = sentenceSection_(plain);
+    if (sent) { section = sent.section; addItems_(out, sent.section, sent.inline); return; }
 
     // 섹션 제목
     const header = detectHeader_(plain);
@@ -349,19 +441,17 @@ function parseCaption_(text) {
       return;
     }
 
-    // '~가 포인트!' 같은 줄은 팁으로
-    if (/(포인트|꿀팁|비법)\s*[!.~♡♥]*$/.test(plain) && plain.length > 6) { out.tips.push(cleanItem_(plain)); return; }
-
     // 번호가 붙은 줄 (1️⃣ 같은 숫자 이모지도 인식하도록 원문으로 검사)
     const stepM = line.match(STEP_RE);
     if (stepM) {
       const body = cleanItem_(line.slice(stepM[0].length));
       if (!body) return;
-      if ((section === 'ingredients' || section === 'sauce') && !looksLikeStep_(body)) {
+      if ((section === 'ingredients' || section === 'sauce') && (isIngredientLine_(body) || !looksLikeStep_(body))) {
         addItems_(out, section, body);
       } else {
         out.steps.push(body);
         section = 'steps';
+        numberedSteps++;
       }
       return;
     }
@@ -369,16 +459,20 @@ function parseCaption_(text) {
     const item = cleanItem_(plain);
     if (!item) return;
     if (section === 'ingredients' || section === 'sauce') {
-      if (looksLikeStep_(item) && !QTY_RE.test(item)) { out.steps.push(item); section = 'steps'; }
+      if (looksLikeStep_(item) && !isIngredientLine_(item)) { out.steps.push(item); section = 'steps'; }
       else addItems_(out, section, item);
     } else if (section === 'steps') {
-      if (item.length >= 3) out.steps.push(item);
+      // 번호 순서 중간에 이어지는 줄·괄호 설명은 앞 단계에 붙이기
+      if (numberedSteps && out.steps.length) out.steps[out.steps.length - 1] += ' ' + item;
+      else if (item.length >= 3) out.steps.push(item);
     } else if (section === 'tips') {
       out.tips.push(item);
     } else {
-      // 섹션 없이 나온 줄: 분량이 있으면 재료, 조리 문장이면 순서, 나머지(소개글)는 버림
-      if (QTY_RE.test(item) && item.length <= 40 && !looksLikeStep_(item)) addItems_(out, 'ingredients', item);
-      else if (looksLikeStep_(item) && out.ingredients.length) out.steps.push(item);
+      // 섹션 없이 나온 줄: 분량이 있으면 재료, 짧은 단어 나열이면 재료, 조리 문장이면 순서, 나머지(소개글)는 버림
+      const parts = item.split(/[,，、·]/).map(x => x.trim()).filter(Boolean);
+      if (isIngredientLine_(item) && item.length <= 80) addItems_(out, 'ingredients', item);
+      else if (parts.length >= 3 && parts.every(x => x.length <= 10) && !looksLikeStep_(item)) addItems_(out, 'ingredients', item);
+      else if (looksLikeStep_(item) && (out.ingredients.length || out.sauce.length)) out.steps.push(item);
     }
   });
 
@@ -386,19 +480,73 @@ function parseCaption_(text) {
   return out;
 }
 
+/** 제목 고르기: '…레시피/만들기' 줄 → 첫 줄(감탄문이면 메뉴명만) → 해시태그 */
+function pickTitle_(lines, tags) {
+  const n = Math.min(lines.length, 6);
+  for (let i = 0; i < n; i++) {
+    const p = lines[i].replace(EMOJI_RE, '').trim();
+    if (PROMO_RE.test(p) || STEP_RE.test(lines[i]) || p.length > 30) continue;
+    if (/(레시피|만들기|만드는\s*법)/.test(p) && !isSentence_(p)) {
+      const c = cleanTitle_(p).replace(/\s*(레시피|만들기|만드는\s*법)\s*$/, '').trim();
+      if (c.length >= 2 && !detectHeader_(p)) return { title: c, index: i };
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    const raw = lines[i];
+    const p = raw.replace(EMOJI_RE, '').trim();
+    if (PROMO_RE.test(p) || detectHeader_(p) || STEP_RE.test(raw) || META_RE.test(p)) continue;
+    if (QTY_RE.test(p) && i > 0) continue;
+    if (!isSentence_(p)) return { title: cleanTitle_(p), index: i };
+    // 인사/소개 문장: "…오늘은 들기름 막국수 알려드릴게요" → "들기름 막국수"
+    const intro = p.match(/(?:오늘은|오늘|이번엔|이번에는)\s*(.{2,20}?)\s*(?:레시피\s*)?(?:를|을)?\s*(?:알려\s*드릴게요|알려드려요|소개할게요|소개해요|만들어\s*볼게요|만들어봤어요|만들었어요|공유할게요|해볼게요)/);
+    if (intro) return { title: cleanTitle_(intro[1]), index: i };
+    // 감탄문/문장: "오늘은 …볶음우동이에요!" → "…볶음우동"
+    const m = p.replace(/^(오늘은|오늘의|이번엔|이번에는|요즘)\s*/, '').match(/^(.{2,24}?)\s*(이에요|예요|입니다|이요|에요)[\s!.~♡♥ㅠㅋ]*$/);
+    if (m && !/(진짜|정말|너무|완전|대박|미쳤|조합)/.test(m[1])) return { title: cleanTitle_(m[1]), index: i };
+    if (i >= 2) break; // 감탄문이면 다음 줄(짧은 메뉴명)을 한 번 더 확인
+  }
+  const tag = tags.find(x => !GENERIC_TAG_RE.test(x) && x.length <= 12);
+  if (tag) return { title: tag, index: -1 };
+  return lines.length ? { title: cleanTitle_(lines[0].replace(EMOJI_RE, '')), index: 0 } : { title: '', index: -1 };
+}
+
+function isSentence_(s) {
+  return s.length > 8 && /(요|다|죠|네|ㅠ+|ㅋ+|ㅎ+|[!?])[\s!?.~♡♥ㅠㅋㅎ]*$/.test(s);
+}
+
+function sentenceSection_(plain) {
+  let m = plain.match(/^(재료|소스|양념장?|드레싱)(는|은)\s+(.+?)(이에요|예요|입니다|이요|에요|요)?[\s.!~]*$/);
+  if (m && QTY_RE.test(m[3])) return { section: m[1] === '재료' ? 'ingredients' : 'sauce', inline: m[3] };
+  m = plain.match(/^(.+?)\s*(을|를)?\s*준비(해\s*주세요|해주세요|하세요|해요|합니다|해\s*둬요|해둬요)[\s.!~]*$/);
+  if (m && QTY_RE.test(m[1])) return { section: 'ingredients', inline: m[1] };
+  return null;
+}
+
 function detectHeader_(plain) {
   let head = plain;
   let inline = '';
+  const br = plain.match(/^[\[【<〈《(]\s*([^\]】>〉》)]{1,12}?)\s*[\]】>〉》)]\s*[:：]?\s*(.+)$/); // [재료] 어묵 3장, …
+  if (br && SECTIONS.some(([, re]) => re.test(br[1].trim()))) { head = br[1]; inline = br[2].trim(); }
+  else {
   const colon = plain.search(/[:：]/);
-  if (colon > 0 && colon <= 14 && !/\d\s*[:：]\s*\d/.test(plain.slice(Math.max(0, colon - 2), colon + 3))) {
+  if (colon > 0 && colon <= 16 && !/\d\s*[:：]\s*\d/.test(plain.slice(Math.max(0, colon - 2), colon + 3))) {
     head = plain.slice(0, colon);
     inline = plain.slice(colon + 1).trim();
   }
-  const core = head.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').replace(/[\[\]【】()（）<>「」『』]/g, '').trim();
-  if (!core || core.length > 14) return null;
-  if (!inline && (QTY_RE.test(core) || STEP_RE.test(plain) || looksLikeStep_(core))) return null;
-  for (const [name, re] of SECTIONS) {
-    if (re.test(core)) return { section: name, inline: inline };
+  }
+  if (!inline && STEP_RE.test(plain)) return null;
+  const tidy = x => x.replace(/\d+\s*인분(\s*기준)?|기준/g, ' ')
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').replace(/\s+/g, ' ').trim();
+  const base = head.replace(EMOJI_RE, '');
+  const cores = [
+    tidy(base.replace(/[(（\[【][^)）\]】]*[)）\]】]/g, ' ')),   // "재료 (2인분 기준)" → 재료
+    tidy(base.replace(/[()（）\[\]【】<>〈〉《》]/g, ' '))           // "[순서]" → 순서
+  ];
+  for (const core of cores) {
+    if (!core || core.length > 14) continue;
+    for (const [name, re] of SECTIONS) {
+      if (re.test(core)) return { section: name, inline: inline };
+    }
   }
   return null;
 }
@@ -406,27 +554,55 @@ function detectHeader_(plain) {
 function addItems_(out, section, text) {
   const target = section === 'sauce' ? out.sauce : section === 'tips' ? out.tips : section === 'steps' ? out.steps : out.ingredients;
   if (section === 'steps' || section === 'tips') { const t = cleanItem_(text); if (t) target.push(t); return; }
-  text.split(/,|，|、|·|ㆍ|\s\/\s|(?<!\d)\/(?!\d)|\s\+\s/).forEach(part => {
-    const t = cleanItem_(part);
-    if (t) target.push(t);
+  text.split(/,|、|·|ㆍ|\s\|\s|\s\/\s|(?<!\d)\/(?!\d)|\s\+\s/).forEach(part => {
+    splitBySpaces_(cleanItem_(part)).forEach(t => { if (t) target.push(t); });
   });
+}
+
+/** "두부1모 대파1/2대 양파1/4개", "간장 3큰술 설탕 1큰술" 처럼 띄어쓰기로만 나열한 재료 나누기 */
+function splitBySpaces_(s) {
+  if (!s) return [];
+  const hasQty = x => QTY_RE.test(x) || /[\p{L})]\s*\d+(\.\d+)?(\/\d+)?$/u.test(x);
+  const tokens = s.split(/\s+/);
+  if (tokens.length < 2) return [cleanItem_(s)];
+  const items = [];
+  let cur = '';
+  tokens.forEach(tok => {
+    const startsWord = /^[가-힣a-zA-Z]/.test(tok) && !/^(약간|적당량|적당히|조금|넉넉히|취향껏|톡톡|정도|분량|이상|이하|내외)/.test(tok);
+    if (cur && hasQty(cur) && startsWord) { items.push(cur); cur = tok; }
+    else cur = cur ? cur + ' ' + tok : tok;
+  });
+  if (cur) items.push(cur);
+  return items.map(x => cleanItem_(x.replace(/([\p{L})])\s*[:：]\s*(?=\S)/gu, '$1 ')));
+}
+
+const COOK_VERB_RE = /(넣어|넣고|넣으|볶아|볶고|볶다|볶으|끓여|끓이|구워|굽고|썰어|썰고|섞어|섞고|올려|부어|붓고|버무려|졸여|데쳐|삶아|익혀|담아|뿌려|절여|부쳐|말아|재워|헹궈|식혀|풀어|풀고|저어|무쳐|다져|채썰|손질|빼고|짜고)/;
+
+/** 재료 줄인가? (분량이 있고 조리 동사가 없으며, 짧거나 분량이 여러 개) */
+function isIngredientLine_(s) {
+  if (!QTY_RE.test(s) || COOK_VERB_RE.test(s)) return false;
+  const qtyCount = s.split(/[\s,，\/+|]+/).filter(t => QTY_RE.test(t)).length;
+  if (qtyCount < 2 && /(요|니다|세요|줘요|해요|어요|아요)[.!~♡♥\s]*$/.test(s)) return false; // "물 300ml에 양념을 풀어요"
+  return s.length <= 20 || qtyCount >= 2 || !looksLikeStep_(s);
 }
 
 function looksLikeStep_(s) {
   return s.length > 28 ||
-    /(다|요|기|세요|줘요|줍니다|니다|해요|하기|끝)[.!~♡♥\s]*$/.test(s) ||
-    /(넣어|넣고|볶아|볶고|끓여|끓이|구워|굽고|썰어|썰고|섞어|섞고|올려|부어|버무려|졸여|데쳐|삶아|익혀|담아|뿌려)/.test(s);
+    /(다|요|기|세요|줘요|줍니다|니다|해요|하기|끝|완성)[.!~♡♥\s]*$/.test(s) ||
+    /(넣어|넣고|볶아|볶고|볶다|끓여|끓이|구워|굽고|썰어|썰고|섞어|섞고|올려|부어|버무려|졸여|데쳐|삶아|익혀|담아|뿌려|절여|부쳐|말아)/.test(s);
 }
 
 function cleanItem_(s) {
   return String(s).replace(EMOJI_RE, '')
-    .replace(/^[\s\-–—•·▪▫◾◽■□●○◆◇▶▷►✓✔︎*+>~]+/, '')
+    .replace(/^[\s\-–—•·▪▫◾◽■□●○◆◇▶▷►➡→✓✔︎*+>~]+/, '')
+    .replace(/([\p{L})])\s*[:：]\s*(?=\d)/gu, '$1 ')
+    .replace(/([\p{L})])\s*[-–—]\s*(?=(\d|한|두|세|반|약간|적당))/gu, '$1 ')
     .replace(/[\s,，.。]+$/, '')
     .trim();
 }
 
 function cleanTitle_(s) {
-  let t = s.replace(EMOJI_RE, '').replace(/[\[\]【】「」『』<>]/g, ' ').replace(/\s+/g, ' ').trim();
+  let t = normalizeText_(s).replace(EMOJI_RE, '').replace(/[\[\]【】「」『』<>]/g, ' ').replace(/\s+/g, ' ').trim();
   t = t.replace(/\s+(레시피|만드는\s*법|만들기)\s*[!.~]*$/, '').trim() || t;
   return t.length > 40 ? t.slice(0, 40) + '…' : t;
 }
@@ -567,23 +743,78 @@ function cleanCaptionInput_(raw) {
   return s;
 }
 
-/** 인스타 게시물 미리보기 정보(og:description / og:image) 가져오기 — 인스타가 막으면 빈 값 */
-function fetchInstagramMeta_(url) {
+/**
+ * 인스타 게시물에서 캡션·대표 이미지 가져오기
+ *  1) 임베드(퍼가기) 페이지 /p/코드/embed/captioned/ — 로그인 없이 캡션이 들어 있음
+ *  2) 실패하면 게시물 페이지의 미리보기 정보(og:description / og:image)
+ * 인스타가 막으면 빈 값
+ */
+function fetchInstagramMeta_(url, html) {
   const out = { caption: '', image: '' };
+  const code = (String(url || '').match(/instagram\.com\/(?:[^\/]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/) || [])[1];
+  if (html) { const r = parseInstagramEmbed_(html); if (r.caption) return r; }   // 단축어가 아이폰에서 받아 보낸 페이지
+  if (!code) return out;
   try {
-    const res = UrlFetchApp.fetch(url, {
+    const res = UrlFetchApp.fetch('https://www.instagram.com/p/' + code + '/embed/captioned/', {
+      muteHttpExceptions: true, followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8' }
+    });
+    if (res.getResponseCode() === 200) {
+      const r = parseInstagramEmbed_(res.getContentText());
+      out.caption = r.caption; out.image = r.image;
+    } else {
+      Logger.log('인스타 임베드 응답 ' + res.getResponseCode());
+    }
+  } catch (err) { Logger.log('인스타 임베드 실패: ' + err.message); }
+  if (out.caption && out.image) return out;
+  try {
+    const res = UrlFetchApp.fetch('https://www.instagram.com/p/' + code + '/', {
       muteHttpExceptions: true, followRedirects: true,
       headers: { 'User-Agent': 'facebookexternalhit/1.1', 'Accept-Language': 'ko-KR,ko;q=0.9' }
     });
-    if (res.getResponseCode() !== 200) return out;
-    const html = res.getContentText();
-    let d = metaContent_(html, 'og:description');
-    const q = d.indexOf(': "');
-    if (q >= 0) d = d.slice(q + 3).replace(/"\s*\.?\s*$/, '');
-    d = d.trim();
-    out.caption = d.length >= 15 ? d : '';
-    out.image = metaContent_(html, 'og:image');
+    if (res.getResponseCode() === 200) {
+      const page = res.getContentText();
+      if (!out.caption) {
+        let d = metaContent_(page, 'og:description');
+        const q = d.indexOf(': "');
+        if (q >= 0) d = d.slice(q + 3).replace(/"\s*\.?\s*$/, '');
+        d = d.trim();
+        if (d.length >= 15) out.caption = d;
+      }
+      if (!out.image) out.image = metaContent_(page, 'og:image');
+    }
   } catch (err) { /* 무시 */ }
+  return out;
+}
+
+/** 임베드 페이지 HTML에서 캡션·이미지 뽑기 (화면용 HTML과 페이지 안의 JSON 둘 다 시도) */
+function parseInstagramEmbed_(html) {
+  const out = { caption: '', image: '' };
+  if (!html) return out;
+  // ① 화면에 보이는 캡션 영역
+  const cap = html.match(/class="Caption"[^>]*>([\s\S]*?)<div class="CaptionComments"/) ||
+    html.match(/class="Caption"[^>]*>([\s\S]*?)<\/div>/);
+  if (cap) {
+    const body = cap[1].replace(/<a[^>]*class="CaptionUsername"[^>]*>[\s\S]*?<\/a>/, '');
+    const text = htmlToText_(body).split('\n').map(x => x.trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text.length >= 15) out.caption = text;
+  }
+  // ② 페이지 안의 JSON (따옴표가 한 번 더 이스케이프된 경우까지)
+  if (!out.caption) {
+    const variants = [html, html.replace(/\\\\/g, '\u0000').replace(/\\"/g, '"').replace(/\\\//g, '/').replace(/\u0000/g, '\\')];
+    const pats = [/"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"((?:[^"\\]|\\.)*)"/, /"caption":\{[^{}]*?"text":"((?:[^"\\]|\\.)*)"/];
+    for (const v of variants) {
+      for (const re of pats) {
+        const m = v.match(re);
+        if (m) { try { const t = JSON.parse('"' + m[1] + '"').trim(); if (t.length >= 15) { out.caption = t; break; } } catch (e) { /* 다음 */ } }
+      }
+      if (out.caption) break;
+    }
+  }
+  const img = html.match(/<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"/) ||
+    html.match(/"display_url":"([^"]+)"/);
+  if (img) out.image = decodeEntities_(img[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/'));
   return out;
 }
 
